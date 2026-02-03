@@ -1,31 +1,24 @@
-# =========================
-# file: travelbuddi/core.py
-# =========================
+# file: streamlit_app.py
 """
-Core logic for TravelBuddi.
+Travel Planner → Packing List, Health Checklist, Places, Transport, Food
 
-Exports:
-- _input_to_jsonable(): fixes date serialization for JSON
-- build_export_zip_bytes(): creates ZIP with Markdown/JSON/CSVs
-
-Run app (from repo root):
-  pip install -r requirements.txt
+Run:
+  pip install streamlit
   streamlit run streamlit_app.py
 
-Run tests:
-  pip install pytest
-  pytest -q
+Notes:
+- This tool provides planning prompts, not medical advice.
+- Always verify health guidance with official travel health sources and a clinician.
 """
 
-import csv
-import io
+from __future__ import annotations
+
 import json
-import zipfile
 from dataclasses import asdict, dataclass, field
 from datetime import date
-from typing import Dict, List, Literal, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Literal, Optional, Set, Tuple
 
-import requests
+import streamlit as st
 
 TripStyle = Literal["Budget", "Mid-range", "Luxury"]
 LuggageType = Literal["Backpack", "Carry-on only", "Checked bag"]
@@ -46,8 +39,6 @@ Activity = Literal[
     "Camping",
     "Water sports",
 ]
-
-Provider = Literal["Offline (no API)", "OpenTripMap", "Google Places (New)"]
 
 
 @dataclass(frozen=True)
@@ -77,26 +68,18 @@ class ChecklistItem:
 
 
 @dataclass
-class PlaceSuggestion:
-    name: str
-    address: str = ""
-    url: str = ""
-    rating: Optional[float] = None
-    rating_count: Optional[int] = None
-    category: str = ""
-
-
-@dataclass
 class GeneratedPlan:
     packing: Dict[str, List[ChecklistItem]] = field(default_factory=dict)
     health: Dict[str, List[ChecklistItem]] = field(default_factory=dict)
     places: Dict[str, List[str]] = field(default_factory=dict)
     transport: Dict[str, List[str]] = field(default_factory=dict)
     food: Dict[str, List[str]] = field(default_factory=dict)
-    enriched: Dict[str, List[PlaceSuggestion]] = field(default_factory=dict)
     reminders: List[str] = field(default_factory=list)
 
 
+# ----------------------------
+# Small internal “starter” datasets (editable by user in app)
+# ----------------------------
 RIDE_HAILING_BY_REGION: Dict[str, List[str]] = {
     "uk_ie": ["Uber (varies by city)", "Bolt (some cities)", "Free Now (some cities)", "Local licensed minicabs"],
     "eu": ["Bolt (many cities)", "Uber (many cities)", "Free Now (some cities)", "Licensed taxi ranks"],
@@ -115,14 +98,17 @@ FOOD_STARTERS_BY_COUNTRY: Dict[str, List[str]] = {
     "italy": ["Regional pasta specialty", "Pizza (local style)", "Gelato", "Aperitivo snacks", "Espresso + pastry"],
     "mexico": ["Tacos (regional)", "Mole (where common)", "Pozole", "Tamales", "Street elote/esquites"],
     "thailand": ["Pad kra pao", "Som tam", "Tom yum", "Khao soi (north)", "Mango sticky rice"],
-    "france": ["Boulangerie bread/pastries", "Cheese plate", "Regional stew/specialty", "Crêpes (if common)", "Local wine (optional)"],
+    "france": ["Boulangerie bread/pastries", "Cheese plate", "Regional stew/specialty", "Crêpes (if common)", "Local wine (if you drink)"],
     "india": ["Regional thali", "Chaat", "Dosa (south)", "Biryani (where famous)", "Masala chai"],
     "spain": ["Tapas crawl", "Paella (where typical)", "Jamón", "Tortilla española", "Churros con chocolate"],
     "vietnam": ["Phở", "Bánh mì", "Bún chả", "Gỏi cuốn (fresh rolls)", "Cà phê sữa đá"],
-    "greece": ["Souvlaki/gyros", "Greek salad", "Seafood (coast/islands)", "Moussaka", "Baklava"],
+    "greece": ["Souvlaki/gyros", "Greek salad", "Seafood (islands/coast)", "Moussaka", "Baklava"],
 }
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def clamp(n: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
@@ -131,25 +117,11 @@ def normalize_text(s: str) -> str:
     return " ".join(s.strip().lower().split())
 
 
-def trip_length_days(start: date, end: date) -> int:
-    delta = (end - start).days
-    return max(1, delta + 1)
-
-
-def uniq_items(items: List[ChecklistItem]) -> List[ChecklistItem]:
-    seen: Set[str] = set()
-    out: List[ChecklistItem] = []
-    for it in items:
-        key = normalize_text(it.item)
-        if key not in seen:
-            seen.add(key)
-            out.append(it)
-    return out
-
-
 def infer_region(destination: str) -> str:
     d = normalize_text(destination)
 
+    # Lightweight heuristics: check for country keywords in input.
+    # Users can type “Paris, France”, “Tokyo Japan”, etc.
     if any(k in d for k in ["uk", "united kingdom", "england", "scotland", "wales", "northern ireland", "ireland", "dublin", "london"]):
         return "uk_ie"
     if any(k in d for k in ["france", "germany", "italy", "spain", "portugal", "netherlands", "belgium", "austria", "switzerland", "sweden", "norway", "denmark", "finland", "poland", "czech", "hungary", "greece", "croatia", "romania"]):
@@ -174,12 +146,42 @@ def infer_region(destination: str) -> str:
 
 def extract_country_key(destination: str) -> Optional[str]:
     d = normalize_text(destination)
+    # Match keys in FOOD_STARTERS_BY_COUNTRY
     for country in FOOD_STARTERS_BY_COUNTRY.keys():
         if country in d:
             return country
+    # Some common aliases
+    aliases = {
+        "united states": None,
+        "usa": None,
+        "uk": None,
+        "united kingdom": None,
+    }
+    for k in aliases:
+        if k in d:
+            return aliases[k]
     return None
 
 
+def trip_length_days(start: date, end: date) -> int:
+    delta = (end - start).days
+    return max(1, delta + 1)
+
+
+def uniq_items(items: List[ChecklistItem]) -> List[ChecklistItem]:
+    seen: Set[str] = set()
+    out: List[ChecklistItem] = []
+    for it in items:
+        key = normalize_text(it.item)
+        if key not in seen:
+            seen.add(key)
+            out.append(it)
+    return out
+
+
+# ----------------------------
+# Generators
+# ----------------------------
 def base_packing() -> Dict[str, List[ChecklistItem]]:
     return {
         "Documents & money": [
@@ -215,7 +217,6 @@ def base_packing() -> Dict[str, List[ChecklistItem]]:
 
 def weather_module(weather: WeatherFeel, rain: int) -> Dict[str, List[ChecklistItem]]:
     out: Dict[str, List[ChecklistItem]] = {"Weather add-ons": []}
-
     if weather == "Cold":
         out["Weather add-ons"] += [
             ChecklistItem("Warm jacket", "Core warmth layer", ("weather", "cold")),
@@ -228,7 +229,7 @@ def weather_module(weather: WeatherFeel, rain: int) -> Dict[str, List[ChecklistI
             ChecklistItem("Hat/cap", "Sun protection", ("weather", "hot")),
             ChecklistItem("Lightweight sandals (optional)", "Heat-friendly footwear", ("weather", "hot")),
         ]
-    else:
+    else:  # Mild
         out["Weather add-ons"] += [
             ChecklistItem("Light jacket", "Evenings can be cooler", ("weather", "mild")),
             ChecklistItem("Layering top", "Flexible comfort", ("weather", "mild")),
@@ -285,13 +286,17 @@ def activity_modules(activities: Tuple[Activity, ...], trip_days: int, trip_styl
             ChecklistItem("Light first-aid kit", "Remote areas", ("activity", "camping", "health")),
         ]
 
+    # Small heuristic: laundry planning
     if trip_days >= 7 and trip_style != "Luxury":
-        out["Activity add-ons"].append(ChecklistItem("Laundry kit (small detergent sheets)", "Light packing for longer trips", ("misc",)))
+        out["Activity add-ons"].append(
+            ChecklistItem("Laundry kit (small detergent sheets)", "Light packing for longer trips", ("misc",))
+        )
 
     return out
 
 
 def health_checklist(region: str) -> Dict[str, List[ChecklistItem]]:
+    # Keep this generic and verification-focused.
     common = [
         ChecklistItem("Check official travel health advice for your destination", "Guidance changes; use official sources", ("health",)),
         ChecklistItem("Confirm routine vaccines are up to date", "Baseline protection", ("health",)),
@@ -299,6 +304,7 @@ def health_checklist(region: str) -> Dict[str, List[ChecklistItem]]:
         ChecklistItem("Consider a basic first-aid kit", "Blisters, minor cuts, headaches", ("health",)),
         ChecklistItem("Verify if proof of vaccination is required for entry/transit", "Some routes have requirements", ("health", "docs")),
     ]
+
     region_prompts: Dict[str, List[ChecklistItem]] = {
         "se_asia": [
             ChecklistItem("Ask a clinician about mosquito-borne illness prevention", "Repellent + behavior planning", ("health",)),
@@ -312,9 +318,19 @@ def health_checklist(region: str) -> Dict[str, List[ChecklistItem]]:
             ChecklistItem("Ask a clinician about mosquito-borne illness prevention", "Repellent + clothing", ("health",)),
             ChecklistItem("Altitude planning (if relevant)", "Some areas require acclimatization", ("health",)),
         ],
-        "mena": [ChecklistItem("Heat and sun plan", "Hydration + shade + sunscreen", ("health",))],
-        "unknown": [ChecklistItem("If unsure, consult a travel clinic 4–8 weeks before travel", "Some vaccines need time/boosters", ("health",))],
+        "mena": [
+            ChecklistItem("Heat and sun plan", "Hydration + shade + sunscreen", ("health",)),
+        ],
+        "eu": [],
+        "uk_ie": [],
+        "us_canada": [],
+        "east_asia": [],
+        "oceania": [],
+        "unknown": [
+            ChecklistItem("If unsure, consult a travel clinic 4–8 weeks before travel", "Some vaccines need time/boosters", ("health",)),
+        ],
     }
+
     return {
         "Health & vaccines (checklist)": common,
         "Destination prompts (verify with clinician)": region_prompts.get(region, []),
@@ -326,48 +342,69 @@ def places_to_visit(activities: Tuple[Activity, ...], destination: str) -> Dict[
     picks: Dict[str, List[str]] = {
         "Ideas based on your interests": [],
         "Easy wins anywhere": [
-            "Do a walking tour on day 1 (fast orientation).",
-            "Pick one neighborhood to wander with no agenda.",
-            "Bookmark 2–3 indoor options for bad weather.",
+            "Find a top-rated walking tour for day 1 (helps you orient fast).",
+            "Pick one neighborhood to wander with no agenda (cafés, parks, shops).",
+            "Bookmark 2–3 indoor options (museum, market) in case of bad weather.",
         ],
         "Destination prompts": [
             f"Search: “best neighborhoods in {d}” and save 2–3 to explore.",
             f"Search: “day trips from {d}” and pick one that matches your pace.",
-            f"Search: “local events in {d} during your dates”.",
+            f"Search: “local events in {d} during your dates” (markets, festivals, shows).",
         ],
     }
 
     if "Museums/Art" in activities:
-        picks["Ideas based on your interests"] += ["One flagship museum + one small gallery.", "Check late-night openings/free entry windows."]
+        picks["Ideas based on your interests"] += [
+            "Visit one flagship museum + one small/gallery space.",
+            "Look for late-night museum openings or free-entry windows.",
+        ]
     if "Food tour" in activities:
-        picks["Ideas based on your interests"] += ["Market visit early in the trip.", "Street-food area with high turnover + visible cooking."]
+        picks["Ideas based on your interests"] += [
+            "Do a market visit early in the trip to learn what to order later.",
+            "Try a street-food area with high turnover and visible cooking.",
+        ]
     if "Hiking" in activities:
-        picks["Ideas based on your interests"] += ["Half-day hike first; then full-day route.", "Download offline trail maps; check daylight hours."]
+        picks["Ideas based on your interests"] += [
+            "Plan a half-day hike first (test legs/gear) before a full-day route.",
+            "Download offline trail maps and check daylight hours.",
+        ]
     if "Beach" in activities:
-        picks["Ideas based on your interests"] += ["One calm beach (morning) + one lively beach (afternoon).", "Pick a sunset spot."]
+        picks["Ideas based on your interests"] += [
+            "Scout a calmer beach for mornings and a lively one for afternoons.",
+            "Plan one ‘sunset spot’ (cliff, pier, rooftop).",
+        ]
     if "Theme parks" in activities:
-        picks["Ideas based on your interests"] += ["Buy timed-entry tickets early if needed.", "Arrive before opening for first rides."]
+        picks["Ideas based on your interests"] += [
+            "Buy timed-entry tickets early if the park uses reservations.",
+            "Arrive before opening for the first 2–3 rides.",
+        ]
     if not picks["Ideas based on your interests"]:
-        picks["Ideas based on your interests"] = ["Each day: 1 landmark, 1 local experience, 1 nature break (park/river)."]
+        picks["Ideas based on your interests"] = [
+            "Pick 1 landmark, 1 local experience (market/café), and 1 nature break (park/river) each day.",
+        ]
+
     return picks
 
 
 def transport_guide(region: str, destination: str) -> Dict[str, List[str]]:
     region_apps = RIDE_HAILING_BY_REGION.get(region, RIDE_HAILING_BY_REGION["unknown"])
     d = destination.strip()
+
     safety = [
-        "Prefer official taxi ranks or app-dispatched rides.",
-        "If street taxis: confirm meter or agree price before starting.",
-        "Share trip details; sit in back if solo.",
-        "At airports: use official/prepaid counters or hotel transfers.",
+        "Prefer official taxi ranks or app-dispatched rides (avoid unmarked solicitations).",
+        "If using street taxis: confirm meter use or agree price before starting.",
+        "Sit in the back if traveling solo; share trip details with a friend.",
+        "Keep small bills/coins for tips where customary.",
+        "At airports: consider prepaid/official counters or hotel-arranged transfers.",
     ]
+
     return {
         "Taxi / ride options": region_apps,
         "Safety checklist": safety,
         "Destination prompts": [
             f"Search: “official taxi number in {d}” and save it.",
-            f"Search: “airport to city center transport {d}” (compare train/bus/taxi).",
-            "Download the local public transit app.",
+            f"Search: “airport to city center transport {d}” (train/bus/taxi cost comparison).",
+            "Download the local public transit app or save a route planner link.",
         ],
     }
 
@@ -375,23 +412,30 @@ def transport_guide(region: str, destination: str) -> Dict[str, List[str]]:
 def food_guide(destination: str, dietary_notes: str) -> Dict[str, List[str]]:
     key = extract_country_key(destination)
     starter = FOOD_STARTERS_BY_COUNTRY.get(key or "", [])
+
     prompts = [
         "Ask locals: “What’s the one dish this city does best?”",
-        "Try: one market meal, one street snack, one sit-down specialty.",
+        "Try one market meal, one street snack, and one sit-down specialty.",
+        "If you drink alcohol: try a local-style aperitif/beer/wine (optional).",
     ]
-    if dietary_notes.strip():
-        prompts.append(f"Diet note: {dietary_notes.strip()}")
+
+    diet = dietary_notes.strip()
+    if diet:
+        prompts.append(f"Diet note to remember: {diet}")
 
     if starter:
-        return {"Local foods (starter list)": starter, "Food game plan": prompts}
+        return {
+            "Local foods (starter list)": starter,
+            "Food game plan": prompts,
+        }
 
     return {
         "Local foods (starter list)": [
             "Signature stew/soup of the region",
-            "Famous street-food item",
-            "Local dessert/pastry",
-            "Common breakfast item",
-            "Seasonal specialty (ask what’s best right now)",
+            "One famous street-food item",
+            "A local dessert/pastry",
+            "A common breakfast item",
+            "A seasonal specialty (ask what’s best right now)",
         ],
         "Food game plan": prompts,
     }
@@ -407,11 +451,12 @@ def generate_plan(inp: TravelInput) -> GeneratedPlan:
     for k, v in activity_modules(inp.activities, days, inp.trip_style).items():
         packing.setdefault(k, []).extend(v)
 
+    # Add small personalization nudges
     if inp.luggage == "Carry-on only":
         packing.setdefault("Carry-on strategy", []).extend(
             [
                 ChecklistItem("Solid toiletries (or <100ml liquids)", "Avoid liquid limits issues", ("luggage",)),
-                ChecklistItem("Wear bulkiest shoes on travel day", "Saves bag space", ("luggage",)),
+                ChecklistItem("Wear your bulkiest shoes on travel day", "Saves bag space", ("luggage",)),
                 ChecklistItem("One versatile jacket", "Reduces overpacking", ("luggage",)),
             ]
         )
@@ -421,58 +466,30 @@ def generate_plan(inp: TravelInput) -> GeneratedPlan:
             ChecklistItem("Any mobility aids / supports you rely on", "Consistency and comfort", ("accessibility",))
         )
 
+    # De-dup within categories
     for cat in list(packing.keys()):
         packing[cat] = uniq_items(packing[cat])
 
+    health = health_checklist(region)
+    places = places_to_visit(inp.activities, inp.destination)
+    transport = transport_guide(region, inp.destination)
+    food = food_guide(inp.destination, inp.dietary_notes)
+
+    reminders = [
+        "Download offline maps + save key addresses (hotel, embassy, meeting venue).",
+        "Set up roaming/eSIM plan before departure.",
+        "Tell your bank about travel if needed; enable contactless payments.",
+        "Save emergency contacts and local emergency number.",
+    ]
+
     return GeneratedPlan(
         packing=packing,
-        health=health_checklist(region),
-        places=places_to_visit(inp.activities, inp.destination),
-        transport=transport_guide(region, inp.destination),
-        food=food_guide(inp.destination, inp.dietary_notes),
-        reminders=[
-            "Download offline maps + save key addresses (hotel, embassy, venues).",
-            "Set up roaming/eSIM plan before departure.",
-            "Enable contactless payments; consider notifying your bank.",
-            "Save local emergency number + key contacts.",
-        ],
+        health=health,
+        places=places,
+        transport=transport,
+        food=food,
+        reminders=reminders,
     )
-
-
-# ----------------------------
-# Export helpers (FIX + ZIP + CSV)
-# ----------------------------
-def _input_to_jsonable(inp: TravelInput) -> dict:
-    d = asdict(inp)
-    d["start_date"] = inp.start_date.isoformat()
-    d["end_date"] = inp.end_date.isoformat()
-    d["activities"] = list(inp.activities)
-    return d
-
-
-def _plan_to_jsonable(plan: GeneratedPlan) -> dict:
-    def item_to_dict(it: ChecklistItem) -> dict:
-        return {"item": it.item, "why": it.why, "tags": list(it.tags)}
-
-    def place_to_dict(p: PlaceSuggestion) -> dict:
-        return {
-            "name": p.name,
-            "address": p.address,
-            "url": p.url,
-            "rating": p.rating,
-            "rating_count": p.rating_count,
-            "category": p.category,
-        }
-
-    return {
-        "packing": {k: [item_to_dict(i) for i in v] for k, v in plan.packing.items()},
-        "health": {k: [item_to_dict(i) for i in v] for k, v in plan.health.items()},
-        "places": plan.places,
-        "transport": plan.transport,
-        "food": plan.food,
-        "enriched": {k: [place_to_dict(p) for p in v] for k, v in plan.enriched.items()},
-        "reminders": plan.reminders,
-    }
 
 
 def plan_to_markdown(inp: TravelInput, plan: GeneratedPlan) -> str:
@@ -490,25 +507,6 @@ def plan_to_markdown(inp: TravelInput, plan: GeneratedPlan) -> str:
         lines.append(f"- Health notes: {inp.health_notes.strip()}")
     lines.append("")
 
-    if plan.enriched:
-        lines.append("## Quick picks (from API)")
-        for section, places in plan.enriched.items():
-            if not places:
-                continue
-            lines.append(f"### {section}")
-            for p in places:
-                meta = []
-                if p.address:
-                    meta.append(p.address)
-                if p.rating is not None and p.rating_count is not None:
-                    meta.append(f"⭐ {p.rating} ({p.rating_count})")
-                tail = " — ".join(meta) if meta else ""
-                if p.url:
-                    lines.append(f"- [{p.name}]({p.url}){(' — ' + tail) if tail else ''}")
-                else:
-                    lines.append(f"- {p.name}{(' — ' + tail) if tail else ''}")
-            lines.append("")
-
     lines.append("## Packing List")
     for cat, items in plan.packing.items():
         lines.append(f"### {cat}")
@@ -523,14 +521,14 @@ def plan_to_markdown(inp: TravelInput, plan: GeneratedPlan) -> str:
             lines.append(f"- [ ] **{it.item}** — {it.why}")
         lines.append("")
 
-    lines.append("## Places to Visit (Prompts)")
+    lines.append("## Places to Visit")
     for cat, items in plan.places.items():
         lines.append(f"### {cat}")
         for s in items:
             lines.append(f"- {s}")
         lines.append("")
 
-    lines.append("## Transport / Taxi (Prompts)")
+    lines.append("## Transport / Taxi")
     for cat, items in plan.transport.items():
         lines.append(f"### {cat}")
         for s in items:
@@ -552,92 +550,17 @@ def plan_to_markdown(inp: TravelInput, plan: GeneratedPlan) -> str:
     return "\n".join(lines)
 
 
-def plan_to_csv(plan: GeneratedPlan) -> Dict[str, str]:
-    """
-    Returns CSV text blobs keyed by filename.
-    """
-    out: Dict[str, str] = {}
-
-    def dump_rows(filename: str, header: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(list(header))
-        for r in rows:
-            w.writerow(list(r))
-        out[filename] = buf.getvalue()
-
-    pack_rows: List[List[str]] = []
-    for cat, items in plan.packing.items():
-        for it in items:
-            pack_rows.append([cat, it.item, it.why, ",".join(it.tags)])
-
-    health_rows: List[List[str]] = []
-    for cat, items in plan.health.items():
-        for it in items:
-            health_rows.append([cat, it.item, it.why, ",".join(it.tags)])
-
-    reminders_rows = [[r] for r in plan.reminders]
-
-    dump_rows("packing_checklist.csv", ["category", "item", "why", "tags"], pack_rows)
-    dump_rows("health_checklist.csv", ["category", "item", "why", "tags"], health_rows)
-    dump_rows("reminders.csv", ["reminder"], reminders_rows)
-
-    return out
-
-
-def build_export_zip_bytes(inp: TravelInput, plan: GeneratedPlan) -> bytes:
-    md = plan_to_markdown(inp, plan).encode("utf-8")
-    json_blob = json.dumps({"input": _input_to_jsonable(inp), "plan": _plan_to_jsonable(plan)}, indent=2, ensure_ascii=False).encode("utf-8")
-    csv_blobs = plan_to_csv(plan)
-
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("travel_plan.md", md)
-        z.writestr("travel_plan.json", json_blob)
-        for filename, content in csv_blobs.items():
-            z.writestr(filename, content.encode("utf-8"))
-
-    return mem.getvalue()
-
-
-# ==============================
-# file: streamlit_app.py
-# ==============================
-"""
-Streamlit UI for TravelBuddi.
-"""
-
-from datetime import date
-
-import streamlit as st
-
-from travelbuddi.core import (
-    GeneratedPlan,
-    Provider,
-    TravelInput,
-    build_export_zip_bytes,
-    generate_plan,
-    plan_to_markdown,
-    _input_to_jsonable,
-    _plan_to_jsonable,
-)
-
-import json
-
-st.set_page_config(page_title="TravelBuddi", page_icon="🧳", layout="wide")
-st.title("🧳 TravelBuddi")
-
-with st.sidebar:
-    st.header("API enrichment")
-    provider: Provider = st.selectbox("Provider", ["Offline (no API)", "OpenTripMap", "Google Places (New)"], index=0)
-    api_key = st.text_input("API key", type="password", help="Optional if Offline. Required for OpenTripMap / Google Places.")
-    radius_km = st.slider("Search radius (km)", 1, 25, 5)
-    max_results = st.slider("Max results per section", 3, 20, 8)
-    cost_saver = st.toggle("Cost-saver mode (Google: fewer fields)", value=True)
-    st.caption("Export: Markdown / JSON / ZIP (MD+JSON+CSVs).")
+# ----------------------------
+# Streamlit UI
+# ----------------------------
+st.set_page_config(page_title="Travel Helper", page_icon="🧳", layout="wide")
+st.title("🧳 Travel Helper: Packing + Health + Places + Transport + Food")
 
 with st.expander("What this is (and isn’t)"):
-    st.write("Generates planning prompts. Health/vaccine items must be verified with official sources + a clinician.")
+    st.write(
+        "This generates **planning prompts**. For vaccines/health requirements, always verify with official travel health guidance "
+        "and a clinician—rules can change."
+    )
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -656,7 +579,7 @@ with col2:
 
 with col3:
     weather = st.selectbox("Weather expectation", ["Cold", "Mild", "Hot"], index=1)
-    rain_likelihood = st.slider("Rain likelihood (%)", 0, 100, 30, 5)
+    rain_likelihood = st.slider("Rain likelihood (%)", min_value=0, max_value=100, value=30, step=5)
     activities = st.multiselect(
         "Activities",
         [
@@ -687,6 +610,7 @@ if generate:
     if not departure.strip() or not destination.strip():
         st.error("Please enter both departure and destination.")
         st.stop()
+
     if end_date < start_date:
         st.error("End date must be on/after start date.")
         st.stop()
@@ -709,10 +633,7 @@ if generate:
         budget_notes=budget_notes.strip(),
     )
 
-    plan: GeneratedPlan = generate_plan(inp)
-
-    # Note: API enrichment lives in core in your earlier version; if you still have it, call it here.
-    # For now, this keeps exports stable even when provider is Offline.
+    plan = generate_plan(inp)
 
     tab_pack, tab_health, tab_places, tab_transport, tab_food, tab_export = st.tabs(
         ["Packing", "Health", "Places", "Transport", "Food", "Export"]
@@ -727,21 +648,21 @@ if generate:
 
     with tab_health:
         st.subheader("Health & vaccines (verify)")
-        st.info("Not medical advice. Verify requirements with official sources and a clinician.")
+        st.info("This is not medical advice. Verify requirements with official sources and a clinician.")
         for cat, items in plan.health.items():
             st.markdown(f"### {cat}")
             for it in items:
                 st.checkbox(f"{it.item} — {it.why}", value=False, key=f"health::{cat}::{it.item}")
 
     with tab_places:
-        st.subheader("Places prompts (offline)")
+        st.subheader("Places to visit")
         for cat, items in plan.places.items():
             st.markdown(f"### {cat}")
             for s in items:
                 st.write(f"- {s}")
 
     with tab_transport:
-        st.subheader("Transport / taxi prompts")
+        st.subheader("Taxi / ride options + safety")
         for cat, items in plan.transport.items():
             st.markdown(f"### {cat}")
             for s in items:
@@ -754,96 +675,54 @@ if generate:
             for s in items:
                 st.write(f"- {s}")
 
+        st.markdown("### Customize your food list")
+        custom_food = st.text_area(
+            "Add your own items (one per line)",
+            value="",
+            placeholder="e.g., Dish name\nAnother dish\nA dessert",
+        )
+        if custom_food.strip():
+            added = [line.strip() for line in custom_food.splitlines() if line.strip()]
+            if added:
+                st.success(f"Added {len(added)} custom items (export will include them).")
+                plan.food.setdefault("Your custom additions", []).extend(added)
+
     with tab_export:
         st.subheader("Export")
-
         md = plan_to_markdown(inp, plan)
-        st.download_button("Download Markdown", data=md.encode("utf-8"), file_name="travel_plan.md", mime="text/markdown")
+        st.download_button(
+            "Download Markdown",
+            data=md.encode("utf-8"),
+            file_name="travel_plan.md",
+            mime="text/markdown",
+        )
 
-        # ✅ FIX: dates are converted to strings
         json_blob = json.dumps(
-            {"input": _input_to_jsonable(inp), "plan": _plan_to_jsonable(plan)},
+            {"input": asdict(inp), "plan": _plan_to_jsonable(plan)},
             indent=2,
             ensure_ascii=False,
         )
-        st.download_button("Download JSON", data=json_blob.encode("utf-8"), file_name="travel_plan.json", mime="application/json")
-
-        # ✅ A: ZIP export (MD + JSON + CSVs)
-        zip_bytes = build_export_zip_bytes(inp, plan)
-        st.download_button("Download ZIP (MD+JSON+CSVs)", data=zip_bytes, file_name="travel_plan.zip", mime="application/zip")
+        st.download_button(
+            "Download JSON",
+            data=json_blob.encode("utf-8"),
+            file_name="travel_plan.json",
+            mime="application/json",
+        )
 
         st.markdown("### Preview (Markdown)")
         st.code(md, language="markdown")
 
 
-# ============================
-# file: tests/test_exports.py
-# ============================
-"""
-pytest -q
-"""
+def _plan_to_jsonable(plan: GeneratedPlan) -> dict:
+    # Streamlit reruns the script; keep serializer simple and stable.
+    def item_to_dict(it: ChecklistItem) -> dict:
+        return {"item": it.item, "why": it.why, "tags": list(it.tags)}
 
-import io
-import json
-import zipfile
-from datetime import date
-
-from travelbuddi.core import TravelInput, generate_plan, _input_to_jsonable, _plan_to_jsonable, build_export_zip_bytes
-
-
-def _sample_input() -> TravelInput:
-    return TravelInput(
-        departure="London, UK",
-        destination="Tokyo, Japan",
-        start_date=date(2026, 2, 10),
-        end_date=date(2026, 2, 14),
-        travelers=1,
-        trip_style="Mid-range",
-        accommodation="Hotel",
-        luggage="Carry-on only",
-        weather="Mild",
-        rain_likelihood=30,
-        activities=("City exploring", "Food tour"),
-        dietary_notes="vegetarian",
-        mobility_notes="",
-        health_notes="",
-        budget_notes="",
-    )
-
-
-def test_input_jsonable_dates_are_strings() -> None:
-    inp = _sample_input()
-    d = _input_to_jsonable(inp)
-    assert isinstance(d["start_date"], str)
-    assert d["start_date"] == "2026-02-10"
-    assert isinstance(d["end_date"], str)
-    assert d["end_date"] == "2026-02-14"
-    assert isinstance(d["activities"], list)
-
-
-def test_plan_json_dumps_ok() -> None:
-    inp = _sample_input()
-    plan = generate_plan(inp)
-    payload = {"input": _input_to_jsonable(inp), "plan": _plan_to_jsonable(plan)}
-    s = json.dumps(payload, ensure_ascii=False)
-    assert "Tokyo" in s
-
-
-def test_zip_contains_expected_files() -> None:
-    inp = _sample_input()
-    plan = generate_plan(inp)
-
-    zbytes = build_export_zip_bytes(inp, plan)
-    assert isinstance(zbytes, (bytes, bytearray))
-    assert len(zbytes) > 50
-
-    with zipfile.ZipFile(io.BytesIO(zbytes), "r") as z:
-        names = set(z.namelist())
-        assert "travel_plan.md" in names
-        assert "travel_plan.json" in names
-        assert "packing_checklist.csv" in names
-        assert "health_checklist.csv" in names
-        assert "reminders.csv" in names
-
-        j = json.loads(z.read("travel_plan.json").decode("utf-8"))
-        assert j["input"]["destination"] == "Tokyo, Japan"
+    return {
+        "packing": {k: [item_to_dict(i) for i in v] for k, v in plan.packing.items()},
+        "health": {k: [item_to_dict(i) for i in v] for k, v in plan.health.items()},
+        "places": plan.places,
+        "transport": plan.transport,
+        "food": plan.food,
+        "reminders": plan.reminders,
+    }
