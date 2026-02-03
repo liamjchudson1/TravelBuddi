@@ -607,8 +607,6 @@ def build_export_zip_bytes(inp: TravelInput, plan: GeneratedPlan) -> bytes:
 Streamlit UI for TravelBuddi.
 """
 
-from __future__ import annotations
-
 from datetime import date
 
 import streamlit as st
