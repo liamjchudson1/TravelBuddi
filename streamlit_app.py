@@ -783,8 +783,6 @@ if generate:
 pytest -q
 """
 
-from __future__ import annotations
-
 import io
 import json
 import zipfile
